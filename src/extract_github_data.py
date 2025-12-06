@@ -31,6 +31,45 @@ import argparse
 
 
 # ============================================================================
+# REQUIRED FIELDS - Edit this list to customize data validation
+# ============================================================================
+# These fields are required for each repository to be considered valid.
+# Repositories missing any of these fields will be filtered out.
+#
+# To answer analysis questions like:
+# - Total repositories on GitHub: need 'id'
+# - Most-starred repos: need 'stargazers_count', 'name', 'full_name'
+# - Popular repos by language: need 'language', 'stargazers_count'
+# - User/org repo count: need 'owner'
+# - Trending by creation date: need 'created_at'
+# - Language popularity over time: need 'language', 'created_at'
+
+REQUIRED_FIELDS = [
+    # Minimal required fields (always present in /repositories endpoint)
+    'id',                  # Unique repository ID (required for counting)
+    'name',                # Repository name
+    'full_name',           # Full name (owner/repo)
+    'owner',               # Owner information (user or organization)
+    'html_url',            # Repository URL
+    # NOTE: The /repositories endpoint returns minimal data for old repos.
+    # If you need full metadata (created_at, stars, language, etc.),
+    # consider using /search/repositories or individual repo API calls.
+    # Uncomment fields below if you're using a different endpoint:
+    # 'description',
+    # 'created_at',
+    # 'updated_at',
+    # 'pushed_at',
+    # 'stargazers_count',
+    # 'watchers_count',
+    # 'forks_count',
+    # 'language',
+    # 'open_issues_count',
+    # 'default_branch',
+    # 'size',
+]
+
+
+# ============================================================================
 # CONFIGURATION
 # ============================================================================
 
@@ -40,6 +79,8 @@ class Config:
     # AWS S3 Settings
     AWS_S3_BUCKET = os.getenv('AWS_S3_BUCKET', 'github-api0-upload')
     AWS_REGION = os.getenv('AWS_REGION', 'us-east-2')
+    # Enable S3 folder partitioning by date (yyyy/mm/dd/)
+    S3_USE_DATE_PARTITIONING = os.getenv('S3_USE_DATE_PARTITIONING', 'true').lower() == 'true'
 
     # GitHub API Settings
     GITHUB_API_BASE_URL = 'https://api.github.com'
@@ -336,6 +377,7 @@ def extract_all_repositories(pages: int, use_cache: bool = True) -> List[Dict]:
 def validate_repository(repo: Dict) -> Tuple[bool, List[str]]:
     """
     Validate a single repository object for required fields and data quality.
+    Uses the global REQUIRED_FIELDS list defined at the top of the file.
 
     Args:
         repo: Repository dictionary to validate
@@ -347,16 +389,8 @@ def validate_repository(repo: Dict) -> Tuple[bool, List[str]]:
     """
     errors = []
 
-    # Required fields that must be present
-    required_fields = [
-        'id', 'name', 'full_name', 'owner', 'html_url',
-        'description', 'created_at', 'updated_at', 'pushed_at',
-        'size', 'stargazers_count', 'watchers_count', 'language',
-        'forks_count', 'open_issues_count', 'default_branch'
-    ]
-
-    # Check for required fields
-    for field in required_fields:
+    # Check for required fields using global REQUIRED_FIELDS list
+    for field in REQUIRED_FIELDS:
         if field not in repo:
             errors.append(f"Missing required field: {field}")
 
@@ -383,9 +417,66 @@ def validate_repository(repo: Dict) -> Tuple[bool, List[str]]:
     return len(errors) == 0, errors
 
 
+def filter_valid_repositories(repos: List[Dict]) -> Tuple[List[Dict], Dict]:
+    """
+    Filter repositories to keep only those that pass validation.
+    Invalid repositories are excluded from the final dataset.
+
+    Args:
+        repos: List of repository dictionaries to validate
+
+    Returns:
+        Tuple[List[Dict], Dict]:
+            - List of valid repositories only
+            - Validation summary with statistics
+    """
+    logger.info("Starting data validation and filtering...")
+
+    total_repos = len(repos)
+    valid_repos_list = []
+    invalid_repos = 0
+    all_errors = []
+
+    for idx, repo in enumerate(repos):
+        is_valid, errors = validate_repository(repo)
+
+        if is_valid:
+            valid_repos_list.append(repo)
+        else:
+            invalid_repos += 1
+            repo_name = repo.get('full_name', f'Unknown (index {idx})')
+            # Only log first few invalid repos to avoid cluttering logs
+            if invalid_repos <= 5:
+                logger.warning(f"Filtering out invalid repo {repo_name}: {errors[:3]}")  # Show first 3 errors
+            all_errors.extend(errors)
+
+    valid_count = len(valid_repos_list)
+
+    # Generate summary statistics
+    summary = {
+        'total_repositories_extracted': total_repos,
+        'valid_repositories': valid_count,
+        'invalid_repositories_filtered': invalid_repos,
+        'validation_rate': f"{(valid_count/total_repos*100):.2f}%" if total_repos > 0 else "0%",
+        'total_errors': len(all_errors),
+        'unique_errors': len(set(all_errors))
+    }
+
+    logger.info(f"Validation complete: {valid_count}/{total_repos} repositories valid")
+    logger.info(f"Filtered out: {invalid_repos} invalid repositories")
+    logger.info(f"Validation rate: {summary['validation_rate']}")
+
+    if invalid_repos > 5:
+        logger.info(f"Suppressed {invalid_repos - 5} validation warnings (too many to display)")
+
+    return valid_repos_list, summary
+
+
 def validate_all_repositories(repos: List[Dict]) -> Dict:
     """
     Validate all repositories and generate data quality report.
+    NOTE: This function only reports validation status, does NOT filter.
+    Use filter_valid_repositories() to exclude invalid repos.
 
     Args:
         repos: List of repository dictionaries to validate
@@ -408,7 +499,7 @@ def validate_all_repositories(repos: List[Dict]) -> Dict:
         else:
             invalid_repos += 1
             repo_name = repo.get('full_name', f'Unknown (index {idx})')
-            logger.warning(f"Validation failed for {repo_name}: {errors}")
+            logger.debug(f"Validation failed for {repo_name}: {errors}")
             all_errors.extend(errors)
 
     # Generate summary statistics
@@ -480,7 +571,11 @@ def get_data_statistics(repos: List[Dict]) -> Dict:
 
 def upload_to_s3(data: List[Dict], metadata: Dict) -> Optional[str]:
     """
-    Upload repository data to S3 bucket with timestamped filename.
+    Upload repository data to S3 bucket with optional date partitioning.
+
+    S3 Structure:
+    - With partitioning (default): s3://bucket/yyyy/mm/dd/github_repos_YYYY-MM-DD_HH-MM-SS.json
+    - Without partitioning: s3://bucket/github_repos_YYYY-MM-DD_HH-MM-SS.json
 
     Args:
         data: List of repository dictionaries to upload
@@ -489,9 +584,22 @@ def upload_to_s3(data: List[Dict], metadata: Dict) -> Optional[str]:
     Returns:
         Optional[str]: S3 object key if successful, None otherwise
     """
-    # Generate timestamped filename
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    filename = f"github_repos_{timestamp}.json"
+    # Generate timestamp and filename
+    now = datetime.now()
+    timestamp = now.strftime('%Y-%m-%d_%H-%M-%S')
+    base_filename = f"github_repos_{timestamp}.json"
+
+    # Build S3 key with optional date partitioning
+    if Config.S3_USE_DATE_PARTITIONING:
+        # Create folder structure: yyyy/mm/dd/filename
+        year = now.strftime('%Y')
+        month = now.strftime('%m')
+        day = now.strftime('%d')
+        s3_key = f"{year}/{month}/{day}/{base_filename}"
+        logger.info(f"Using date partitioning: {year}/{month}/{day}/")
+    else:
+        s3_key = base_filename
+        logger.info("Date partitioning disabled, uploading to root")
 
     # Prepare data package with metadata
     data_package = {
@@ -509,12 +617,12 @@ def upload_to_s3(data: List[Dict], metadata: Dict) -> Optional[str]:
         # Initialize S3 client
         s3_client = boto3.client('s3', region_name=Config.AWS_REGION)
 
-        logger.info(f"Uploading to S3: s3://{Config.AWS_S3_BUCKET}/{filename}")
+        logger.info(f"Uploading to S3: s3://{Config.AWS_S3_BUCKET}/{s3_key}")
 
         # Upload JSON data
         s3_client.put_object(
             Bucket=Config.AWS_S3_BUCKET,
-            Key=filename,
+            Key=s3_key,
             Body=json.dumps(data_package, indent=2),
             ContentType='application/json',
             Metadata={
@@ -524,9 +632,9 @@ def upload_to_s3(data: List[Dict], metadata: Dict) -> Optional[str]:
         )
 
         logger.info(f"Successfully uploaded {len(data)} repositories to S3")
-        logger.info(f"S3 URI: s3://{Config.AWS_S3_BUCKET}/{filename}")
+        logger.info(f"S3 URI: s3://{Config.AWS_S3_BUCKET}/{s3_key}")
 
-        return filename
+        return s3_key
 
     except Exception as e:
         logger.error(f"Failed to upload to S3: {e}")
@@ -574,13 +682,18 @@ def main():
         logger.error("No repositories extracted. Exiting.")
         return 1
 
-    # Step 2: Validate data quality
-    logger.info("STEP 2: Validating data quality")
-    validation_summary = validate_all_repositories(repositories)
+    # Step 2: Validate and filter data quality
+    logger.info("STEP 2: Validating and filtering data quality")
+    valid_repositories, validation_summary = filter_valid_repositories(repositories)
 
-    # Step 3: Calculate statistics
+    if not valid_repositories:
+        logger.error("No valid repositories after filtering. Exiting.")
+        logger.error("Consider adjusting REQUIRED_FIELDS at top of script")
+        return 1
+
+    # Step 3: Calculate statistics (only on valid repos)
     logger.info("STEP 3: Calculating data statistics")
-    statistics = get_data_statistics(repositories)
+    statistics = get_data_statistics(valid_repositories)
 
     # Step 4: Upload to S3
     if not args.skip_upload:
@@ -589,7 +702,7 @@ def main():
             'validation': validation_summary,
             'statistics': statistics
         }
-        s3_key = upload_to_s3(repositories, metadata)
+        s3_key = upload_to_s3(valid_repositories, metadata)
 
         if not s3_key:
             logger.error("S3 upload failed. Exiting.")
@@ -602,8 +715,9 @@ def main():
     logger.info("Extraction Pipeline Complete!")
     logger.info("="*70)
     logger.info(f"Summary:")
-    logger.info(f"  ✓ Repositories extracted: {len(repositories)}")
-    logger.info(f"  ✓ Valid repositories: {validation_summary['valid_repositories']}")
+    logger.info(f"  ✓ Repositories extracted: {validation_summary['total_repositories_extracted']}")
+    logger.info(f"  ✓ Valid repositories uploaded: {len(valid_repositories)}")
+    logger.info(f"  ✓ Invalid repositories filtered: {validation_summary['invalid_repositories_filtered']}")
     logger.info(f"  ✓ Validation rate: {validation_summary['validation_rate']}")
     logger.info(f"  ✓ Top language: {list(statistics['top_10_languages'].keys())[0] if statistics['top_10_languages'] else 'N/A'}")
     if not args.skip_upload:
