@@ -16,16 +16,18 @@ Features:
 - Test mode for quick validation
 
 Usage:
-    # Test mode (1 page = 100 repos)
-    python extract_github_data.py --test-mode
+    # Test mode (59 repos with 60 req/hour limit)
+    python extract_github_data.py --test-mode --skip-upload
 
-    # Production mode (60 requests/hour)
+    # Production mode (59 repos with 60 req/hour limit)
     python extract_github_data.py
 
-    # Skip S3 upload
-    python extract_github_data.py --skip-upload
+    # With GitHub token (4999 repos with 5000 req/hour limit)
+    export GITHUB_TOKEN=ghp_your_token
+    export MAX_REQUESTS_PER_RUN=5000
+    python extract_github_data.py
 
-    # Use cache
+    # Use cache (recommended to avoid re-fetching)
     python extract_github_data.py --use-cache
 """
 
@@ -87,8 +89,7 @@ class Config:
 
     # Extraction Settings
     REPOS_PER_PAGE = 100  # Maximum allowed by GitHub API
-    MAX_REQUESTS_PER_RUN = int(os.getenv('MAX_REQUESTS_PER_RUN', '60'))  # Rate limit
-    TEST_MODE_PAGES = 1  # Test mode: 1 page = 100 repos
+    MAX_REQUESTS_PER_RUN = int(os.getenv('MAX_REQUESTS_PER_RUN', '60'))  # Rate limit (1 list + 59 details = 59 repos)
 
     # Cache Settings
     USE_CACHE = os.getenv('USE_CACHE', 'true').lower() == 'true'
@@ -624,15 +625,16 @@ def extract_repositories(test_mode: bool = False, use_cache: bool = True, skip_u
     since = get_last_repo_id()
 
     # Calculate request budget
+    # IMPORTANT: Always respect rate limits!
+    # 1 request for list + (MAX_REQUESTS_PER_RUN - 1) requests for details
+    max_repos = Config.MAX_REQUESTS_PER_RUN - 1
+
     if test_mode:
-        max_repos = Config.REPOS_PER_PAGE * Config.TEST_MODE_PAGES  # 100 repos
         logger.info("=" * 80)
-        logger.info("TEST MODE: Extracting 1 page (100 repositories)")
+        logger.info(f"TEST MODE: Max {max_repos} repositories")
+        logger.info(f"Rate limit: {Config.MAX_REQUESTS_PER_RUN} requests/hour")
         logger.info("=" * 80)
     else:
-        # In production: 1 request for list + N requests for details
-        # With 60 req/hour limit: 1 list + 59 details = 59 repos
-        max_repos = Config.MAX_REQUESTS_PER_RUN - 1
         logger.info("=" * 80)
         logger.info(f"PRODUCTION MODE: Max {max_repos} repositories")
         logger.info(f"Rate limit: {Config.MAX_REQUESTS_PER_RUN} requests/hour")
@@ -773,7 +775,7 @@ def main():
     parser.add_argument(
         '--test-mode',
         action='store_true',
-        help='Test mode: Extract only 1 page (100 repos)'
+        help='Test mode: Same as production but with logging emphasis (59 repos with 60 req/hour limit)'
     )
     parser.add_argument(
         '--use-cache',

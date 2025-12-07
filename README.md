@@ -1,22 +1,30 @@
 # GitHub to Snowflake Data Ingestion Pipeline
 
-A Python-based data pipeline that extracts GitHub repository metadata via the GitHub API, validates data quality, and uploads to AWS S3 for further processing and loading into Snowflake.
+Extract GitHub repository metadata via API and upload to AWS S3 for Snowflake analysis.
 
 ## 🏗️ Architecture
 
 ```
-GitHub API → Python Script → AWS S3 → Snowflake (Future)
+GitHub API → Python Script → AWS S3 → Snowflake (manual COPY INTO)
 ```
+
+**Two-Step Process:**
+1. Fetch repository list (100 IDs per request)
+2. Fetch detailed metadata for each repository
+
+**Data Structure:** Flattened JSON with owner fields at top level for easier Snowflake querying.
 
 ## 📋 Features
 
-- ✅ **GitHub API Integration**: Fetch repository metadata with pagination support
-- ✅ **Rate Limiting**: Automatic detection and handling of API rate limits
-- ✅ **Smart Caching**: Cache API responses locally to minimize API usage during development
-- ✅ **Data Validation**: Comprehensive data quality checks on all extracted data
-- ✅ **S3 Upload**: Automated upload to AWS S3 with timestamped filenames
-- ✅ **Logging**: Detailed logging to both console and file
-- ✅ **Error Handling**: Robust error handling with retry logic
+- ✅ Two-step extraction for complete metadata
+- ✅ Flattened data structure (owner fields at top level)
+- ✅ Resume capability (tracks last processed repo ID)
+- ✅ Multiple storage options for state tracking (file/env/s3/dynamo)
+- ✅ Rate limit handling (60 req/hour unauthenticated, 5000 with token)
+- ✅ Smart caching to minimize API usage
+- ✅ Data validation and quality checks
+- ✅ S3 upload with date partitioning (yyyy/mm/dd/)
+- ✅ Comprehensive logging (console + timestamped files)
 
 ## 🚀 Quick Start
 
@@ -24,214 +32,261 @@ GitHub API → Python Script → AWS S3 → Snowflake (Future)
 
 - Python 3.8+
 - AWS CLI configured with credentials
-- Access to S3 bucket: `github-api0-upload` (us-east-2)
+- S3 bucket access (default: `github-api0-upload` in us-east-2)
 
 ### Installation
 
-1. Clone the repository:
 ```bash
+# Clone repository
 git clone https://github.com/AlexG-Mtl/ag-data-ingestion-github-to-snowflake.git
 cd ag-data-ingestion-github-to-snowflake
-```
 
-2. Install required packages:
-```bash
+# Install dependencies
 pip install -r requirements.txt
-```
 
-3. Configure environment variables (optional):
-```bash
+# Configure (optional - defaults work)
 cp .env.example .env
-# Edit .env with your settings
 ```
 
-### Usage
+### Basic Usage
 
-**Basic usage (with defaults):**
+**Test run** (59 repos, no S3 upload):
 ```bash
-python src/extract_github_data.py
+python src/extract_github_data.py --test-mode --skip-upload --use-cache
 ```
 
-**Use cached responses (recommended for development):**
+**Production run** (59 repos, uploads to S3):
 ```bash
 python src/extract_github_data.py --use-cache
 ```
 
-**Test without uploading to S3:**
+**With GitHub token** (4999 repos per hour):
 ```bash
-python src/extract_github_data.py --skip-upload
+export GITHUB_TOKEN=ghp_your_token_here
+export MAX_REQUESTS_PER_RUN=5000
+python src/extract_github_data.py --use-cache
 ```
 
-**Combine options:**
+**Resume after interruption** (automatic):
 ```bash
-python src/extract_github_data.py --use-cache --skip-upload
+# First run
+python src/extract_github_data.py --test-mode
+^C  # Interrupted
+
+# Second run - automatically resumes from last position
+python src/extract_github_data.py --test-mode
 ```
 
 ## ⚙️ Configuration
 
-Configuration can be set via environment variables or by editing `.env` file:
+Configure via environment variables or `.env` file:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `AWS_S3_BUCKET` | S3 bucket name | `github-api0-upload` |
 | `AWS_REGION` | AWS region | `us-east-2` |
-| `GITHUB_TOKEN` | GitHub Personal Access Token (optional) | `` |
-| `PAGES_TO_EXTRACT` | Number of pages to extract | `2` |
-| `REPOS_PER_PAGE` | Repositories per page | `50` |
+| `S3_USE_DATE_PARTITIONING` | Enable yyyy/mm/dd folders | `true` |
+| `GITHUB_TOKEN` | GitHub Personal Access Token | `` |
+| `MAX_REQUESTS_PER_RUN` | API request budget per run | `60` |
+| `SINCE_STORAGE_METHOD` | State storage (file/env/s3/dynamo) | `file` |
+| `SINCE_FILE_PATH` | State file location | `last_repo_id.txt` |
 | `USE_CACHE` | Enable response caching | `true` |
-| `CACHE_DIR` | Cache directory | `cache` |
 | `LOG_LEVEL` | Logging level | `INFO` |
-| `LOG_DIR` | Log directory | `logs` |
 
 ## 📊 Output
 
-### S3 Upload Format
+### S3 Structure
 
-Files are uploaded to S3 with the following structure:
+```
+s3://github-api0-upload/
+├── 2025/12/07/
+│   ├── github_repos_2025-12-07_10-41-17.json
+│   └── github_repos_2025-12-07_11-45-23.json
+```
+
+### JSON Format
 
 ```json
 {
   "metadata": {
-    "extraction_timestamp": "2025-12-06_15-30-45",
-    "total_repositories": 100,
-    "pages_extracted": 2,
-    "repos_per_page": 50,
-    "validation": {
-      "total_repositories": 100,
-      "valid_repositories": 100,
-      "invalid_repositories": 0,
-      "validation_rate": "100.00%"
-    },
-    "statistics": {
-      "total_stars": 15234,
-      "top_10_languages": {...}
-    }
+    "extraction_date": "2025-12-07T10:41:17",
+    "start_repo_id": 0,
+    "last_repo_id": 370,
+    "total_processed": 59,
+    "valid_count": 54,
+    "invalid_count": 3,
+    "failed_count": 2
   },
-  "repositories": [...]
+  "repositories": [
+    {
+      "id": 1,
+      "name": "grit",
+      "full_name": "mojombo/grit",
+      "description": "...",
+      "stargazers_count": 1920,
+      "language": "Ruby",
+      "created_at": "2007-10-29T14:37:16Z",
+      "updated_at": "2024-11-15T10:23:45Z",
+      "owner_login": "mojombo",
+      "owner_id": 1,
+      "owner_type": "User",
+      "owner_avatar_url": "...",
+      "owner_url": "https://github.com/mojombo"
+    }
+  ]
 }
 ```
 
-### Logs
+### Flattened Structure Benefits
 
-Logs are stored in the `logs/` directory with format:
+- No nested queries in Snowflake
+- Direct field access: `SELECT owner_login, owner_type FROM repos`
+- Easy filtering: `WHERE owner_type = 'Organization'`
+
+## 🔄 How It Works
+
+### Two-Step Process
+
+**Step 1:** Get repository list (1 API call)
 ```
-logs/github_extract_YYYYMMDD_HHMMSS.log
+GET /repositories?since=0&per_page=100
+→ Returns 100 repository IDs
 ```
 
-### Cache
-
-API responses are cached in `cache/` directory:
+**Step 2:** Get details for each repo (59 API calls with 60 req/hour limit)
 ```
-cache/github_repos_page_1.json
-cache/github_repos_page_2.json
+GET /repos/mojombo/grit
+GET /repos/wycats/merb-core
+... (59 repos total)
 ```
 
-## 🔍 Script Explanation
+**Total:** 60 API calls = 59 repositories with complete metadata
 
-### Main Components
+### Resume Capability
 
-1. **Configuration (lines 33-71)**
-   - Loads settings from environment variables
-   - Sets defaults for all parameters
-   - Manages API endpoints and rate limiting settings
-
-2. **Logging Setup (lines 76-123)**
-   - Configures dual logging (console + file)
-   - Creates timestamped log files
-   - Formats log messages for readability
-
-3. **Caching Functions (lines 129-178)**
-   - `save_to_cache()`: Saves API responses to local JSON files
-   - `load_from_cache()`: Loads previously cached responses
-   - Minimizes API usage during development and testing
-
-4. **GitHub API Functions (lines 184-328)**
-   - `get_api_headers()`: Builds request headers (with optional auth)
-   - `check_rate_limit()`: Monitors API rate limit status
-   - `fetch_repositories_page()`: Fetches single page with error handling
-   - `extract_all_repositories()`: Orchestrates multi-page extraction
-
-5. **Data Validation (lines 334-478)**
-   - `validate_repository()`: Validates individual repository data
-   - `validate_all_repositories()`: Validates entire dataset
-   - `get_data_statistics()`: Calculates data statistics
-
-6. **S3 Upload (lines 484-542)**
-   - `upload_to_s3()`: Uploads data package to S3
-   - Includes metadata and statistics
-   - Uses timestamped filenames
-
-7. **Main Execution (lines 548-622)**
-   - Orchestrates complete pipeline
-   - Handles command-line arguments
-   - Provides detailed progress logging
-
-## 🔐 API Rate Limiting
-
-### Unauthenticated Requests
-- **Limit**: 60 requests per hour
-- **Coverage**: With 2 pages × 50 repos = 100 repositories
-- **API Calls**: 2 requests (well within limit)
-
-### Authenticated Requests (Optional)
-To increase rate limit to 5000 requests/hour:
-
-1. Create a GitHub Personal Access Token:
-   - Go to GitHub Settings → Developer settings → Personal access tokens
-   - Generate new token (no special scopes needed for public repo metadata)
-
-2. Set the token:
+Progress is automatically saved. If interrupted:
 ```bash
-export GITHUB_TOKEN=your_token_here
+# Check last position
+cat last_repo_id.txt  # Shows: 164
+
+# Resume automatically
+python src/extract_github_data.py --test-mode
+# Output: "Resuming from repo ID: 164"
 ```
+
+**Storage Options:**
+- **file** (default): Local text file
+- **env**: Environment variable (for containers)
+- **s3**: S3 object (for distributed systems)
+- **dynamo**: DynamoDB table (for production)
+
+## 🔐 Rate Limits
+
+| Authentication | Limit | Repos/Hour |
+|----------------|-------|------------|
+| None | 60 req/hour | 59 |
+| GitHub Token | 5000 req/hour | 4999 |
+
+**Get a token:** GitHub Settings → Developer settings → Personal access tokens (no special scopes needed for public repos)
 
 ## 🧪 Testing
 
-### Initial Test (2 pages, ~100 repos)
+**Reset state and start fresh:**
 ```bash
-# Test with cache and S3 upload
-python src/extract_github_data.py --use-cache
-
-# Test without S3 upload
-python src/extract_github_data.py --use-cache --skip-upload
+rm last_repo_id.txt
+python src/extract_github_data.py --test-mode --skip-upload
 ```
 
-### Development Testing
-When modifying the script, use cached data to avoid API calls:
+**Check logs:**
 ```bash
-python src/extract_github_data.py --use-cache --skip-upload
+tail -f logs/github_extract_*.log
 ```
 
-## 📈 Future Enhancements
-
-- [ ] Snowflake integration for automated data loading
-- [ ] Incremental load strategy for daily updates
-- [ ] Scheduling via cron or AWS Lambda
-- [ ] Data deduplication logic
-- [ ] Compression for S3 uploads (gzip)
-- [ ] Email notifications on success/failure
-
-## 🤝 Development Workflow
-
-1. Pull latest from develop:
+**View latest S3 upload:**
 ```bash
+aws s3 ls s3://github-api0-upload/2025/12/07/ --human-readable
+```
+
+## 📈 Next Steps
+
+### Snowflake Integration
+
+1. **Create Snowflake table:**
+```sql
+CREATE TABLE github_repos (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR,
+    full_name VARCHAR,
+    html_url VARCHAR,
+    description VARCHAR,
+    stargazers_count INTEGER,
+    language VARCHAR,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    owner_login VARCHAR,
+    owner_id INTEGER,
+    owner_type VARCHAR,
+    owner_avatar_url VARCHAR,
+    owner_url VARCHAR
+);
+```
+
+2. **Load data from S3:**
+```sql
+COPY INTO github_repos
+FROM 's3://github-api0-upload/2025/12/07/'
+CREDENTIALS = (AWS_KEY_ID='...' AWS_SECRET_KEY='...')
+FILE_FORMAT = (TYPE = JSON);
+```
+
+3. **Query examples:**
+```sql
+-- Top 10 most-starred repos
+SELECT full_name, stargazers_count, language
+FROM github_repos
+ORDER BY stargazers_count DESC
+LIMIT 10;
+
+-- Repos by owner type
+SELECT owner_type, COUNT(*) as count
+FROM github_repos
+GROUP BY owner_type;
+
+-- Popular languages
+SELECT language, AVG(stargazers_count) as avg_stars
+FROM github_repos
+WHERE language IS NOT NULL
+GROUP BY language
+ORDER BY avg_stars DESC;
+```
+
+## 🛠️ Development
+
+**Workflow:**
+```bash
+# Pull latest
 git checkout develop
 git pull origin develop
-```
 
-2. Create feature branch:
-```bash
-git checkout -b feature/your-feature-name
-```
+# Create feature branch
+git checkout -b feature/your-feature
 
-3. Make changes and test
+# Test changes
+python src/extract_github_data.py --test-mode --skip-upload
 
-4. Commit to develop:
-```bash
+# Commit
 git checkout develop
-git merge feature/your-feature-name
+git merge feature/your-feature
 git push origin develop
 ```
+
+## 📄 Files
+
+- `src/extract_github_data.py` - Main extraction script
+- `.env.example` - Configuration template
+- `requirements.txt` - Python dependencies
+- `cloude.md` - Project overview
+- `README.md` - This file
 
 ## 📄 License
 
@@ -240,3 +295,7 @@ MIT License
 ## 👤 Author
 
 Alex G
+
+---
+
+**Status:** Production-ready for GitHub API → S3 pipeline. Snowflake integration requires manual COPY INTO commands.
