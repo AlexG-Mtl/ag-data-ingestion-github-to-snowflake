@@ -1,0 +1,44 @@
+name: Scheduled GitHub Data Extraction (7-Day Run)
+
+on:
+  schedule:
+    # Run every hour at 30 minutes past the hour (e.g., 17:30, 18:30, 19:30)
+    # Cron runs in UTC - for 17:30 EST, first run will be manual trigger
+    - cron: '30 * * * *'
+  workflow_dispatch:  # Manual trigger for starting at 17:30 EST
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # Safety timeout (normal run takes ~2 minutes)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t github-extractor .
+
+      - name: Run extraction
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          docker run --rm \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e SINCE_STORAGE_METHOD=s3 \
+            -e AWS_S3_BUCKET=github-api0-upload \
+            -e AWS_REGION=us-east-2 \
+            -e MAX_REQUESTS_PER_RUN=60 \
+            -e USE_CACHE=true \
+            -e LOG_LEVEL=INFO \
+            -e CACHE_DIR=/app/cache \
+            -e LOG_DIR=/app/logs \
+            github-extractor --use-cache
+
+      - name: Log completion
+        if: always()
+        run: |
+          echo "Extraction completed at $(date)"
+          echo "Check S3 for results: s3://github-api0-upload/"
