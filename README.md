@@ -30,11 +30,62 @@ GitHub API → Python Script → AWS S3 → Snowflake (manual COPY INTO)
 
 ### Prerequisites
 
-- Python 3.8+
-- AWS CLI configured with credentials
+**For Docker (Recommended):**
+- Docker Engine installed
+- AWS credentials (Access Key ID and Secret Access Key)
 - S3 bucket access (default: `github-api0-upload` in us-east-2)
 
-### Installation
+**For Local Python:**
+- Python 3.8+
+- AWS CLI configured with credentials
+- S3 bucket access
+
+### Option 1: Docker Setup (Recommended)
+
+Docker provides a portable, consistent environment with automatic S3 state tracking.
+
+```bash
+# 1. Clone repository
+git clone https://github.com/AlexG-Mtl/ag-data-ingestion-github-to-snowflake.git
+cd ag-data-ingestion-github-to-snowflake
+
+# 2. Set up AWS credentials
+cp .env.docker.example .env.docker
+# Edit .env.docker and add your AWS credentials
+
+# 3. Migrate state to S3 (first time only)
+echo "0" | aws s3 cp - s3://github-api0-upload/github_extraction_state/last_repo_id.txt
+
+# 4. Build Docker image
+docker-compose build
+
+# 5. Test run (no S3 upload)
+./run-docker.sh test
+# OR: docker-compose run --rm github-extractor --test-mode --skip-upload
+
+# 6. Production run
+./run-docker.sh prod
+# OR: docker-compose up
+```
+
+**Docker Commands:**
+```bash
+./run-docker.sh test     # Test mode (59 repos, no S3 upload)
+./run-docker.sh prod     # Production mode (59 repos, upload to S3)
+./run-docker.sh custom "--use-cache --skip-upload"  # Custom flags
+./run-docker.sh clean    # Remove containers and volumes
+./run-docker.sh shell    # Interactive bash shell
+./run-docker.sh logs     # View container logs
+```
+
+**Docker Features:**
+- ✅ S3-based state tracking (portable across machines)
+- ✅ No local file dependencies
+- ✅ Consistent environment
+- ✅ Persistent cache and logs via volumes
+- ✅ Runs as non-root user for security
+
+### Option 2: Local Python Setup
 
 ```bash
 # Clone repository
@@ -48,7 +99,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### Basic Usage
+**Basic Usage:**
 
 **Test run** (59 repos, no S3 upload):
 ```bash
@@ -282,11 +333,23 @@ git push origin develop
 
 ## 📄 Files
 
+**Core Files:**
 - `src/extract_github_data.py` - Main extraction script
-- `.env.example` - Configuration template
 - `requirements.txt` - Python dependencies
-- `cloude.md` - Project overview
 - `README.md` - This file
+
+**Configuration:**
+- `.env.example` - Local Python configuration template
+- `.env.docker.example` - Docker configuration template
+
+**Docker Files:**
+- `Dockerfile` - Container image definition
+- `docker-compose.yml` - Service orchestration
+- `.dockerignore` - Build optimization
+- `run-docker.sh` - Helper script for Docker operations
+
+**Documentation:**
+- `cloude.md` - Project overview
 
 ## 📄 License
 

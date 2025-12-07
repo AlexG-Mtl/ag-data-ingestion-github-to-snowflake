@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  github-extractor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: github-extractor:latest
+    container_name: github-data-extractor
+    env_file:
+      - .env.docker
+    volumes:
+      # Named volumes for persistence (optional)
+      - cache-data:/app/cache
+      - logs-data:/app/logs
+    restart: "no"  # One-time execution (don't restart on exit)
+    # Default command: production mode with cache
+    command: ["--use-cache"]
+
+volumes:
+  # Persist cache between runs (improves performance)
+  cache-data:
+    driver: local
+  # Persist logs for debugging
+  logs-data:
+    driver: local
