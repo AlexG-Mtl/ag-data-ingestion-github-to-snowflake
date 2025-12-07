@@ -311,6 +311,45 @@ GROUP BY language
 ORDER BY avg_stars DESC;
 ```
 
+## ⏰ Automated Scheduling (GitHub Actions)
+
+**For continuous, unattended data collection:**
+
+The repository includes a GitHub Actions workflow for automated hourly extraction.
+
+### Setup
+
+1. **Add AWS Credentials to GitHub Secrets:**
+   - Repository Settings → Secrets and variables → Actions
+   - Add `AWS_ACCESS_KEY_ID`
+   - Add `AWS_SECRET_ACCESS_KEY`
+
+2. **Workflow is activated when merged to main branch**
+
+3. **Start the workflow:**
+   - Actions tab → "Scheduled GitHub Data Extraction (7-Day Run)"
+   - Click "Run workflow" to start
+   - Runs automatically every hour at :30 minutes
+
+### Features
+- ✅ Runs hourly (59 repos per hour)
+- ✅ S3 state tracking (automatic resume)
+- ✅ 7-day continuous run = 9,912 repos
+- ✅ No manual intervention needed
+- ✅ Built-in error handling and retry
+
+### Monitor Progress
+```bash
+# Check current state
+aws s3 cp s3://github-api0-upload/github_extraction_state/last_repo_id.txt -
+
+# View S3 uploads
+aws s3 ls s3://github-api0-upload/2025/12/ --recursive
+```
+
+### Stop Workflow
+After desired duration: Actions → Workflow → "..." → Disable
+
 ## 🛠️ Development
 
 **Workflow:**
@@ -348,8 +387,8 @@ git push origin develop
 - `.dockerignore` - Build optimization
 - `run-docker.sh` - Helper script for Docker operations
 
-**Documentation:**
-- `cloude.md` - Project overview
+**GitHub Actions:**
+- `.github/workflows/scheduled-extraction.yml` - Automated hourly extraction workflow
 
 ## 📄 License
 
