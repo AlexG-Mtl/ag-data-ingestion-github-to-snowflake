@@ -1,0 +1,66 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+
+# Cache and state files
+cache/
+*.cache
+last_repo_id.txt
+
+# Logs
+logs/
+*.log
+
+# Environment files (will be mounted/env vars)
+.env
+.env.docker
+.env.example
+
+# Documentation
+README.md
+cloude.md
+*.md
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Testing
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Temporary files
+test2.txt
+temp_*
+
+# Docker files (no need to include in context)
+Dockerfile
+docker-compose.yml
+.dockerignore
