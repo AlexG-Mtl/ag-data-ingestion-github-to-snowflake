@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 """
-GitHub Data Extraction Script
-==============================
-Extracts repository metadata from GitHub API, validates data quality,
-and uploads to AWS S3 bucket for further processing.
+GitHub Data Extraction Script - Two-Step Process
+=================================================
+Step 1: Fetch repository list from /repositories endpoint
+Step 2: Fetch detailed information for each repository
 
 Features:
-- Pagination support with configurable limits
-- Rate limiting detection and handling
-- Response caching to minimize API usage during development
-- Data quality validation
-- S3 upload with timestamped filenames
+- Two-step extraction (list + details) for complete metadata
+- Resume capability using 'since' parameter
+- Rate limiting handling (60 requests/hour unauthenticated)
+- Response caching to minimize API usage
+- Flattened owner fields for easier analysis
+- S3 upload with date partitioning
 - Comprehensive logging
+- Test mode for quick validation
 
 Usage:
-    python extract_github_data.py [--use-cache] [--skip-upload]
+    # Test mode (1 page = 100 repos)
+    python extract_github_data.py --test-mode
+
+    # Production mode (60 requests/hour)
+    python extract_github_data.py
+
+    # Skip S3 upload
+    python extract_github_data.py --skip-upload
+
+    # Use cache
+    python extract_github_data.py --use-cache
 """
 
 import os
@@ -31,41 +43,29 @@ import argparse
 
 
 # ============================================================================
-# REQUIRED FIELDS - Edit this list to customize data validation
+# REQUIRED FIELDS - Flattened structure for Snowflake
 # ============================================================================
-# These fields are required for each repository to be considered valid.
-# Repositories missing any of these fields will be filtered out.
-#
-# To answer analysis questions like:
-# - Total repositories on GitHub: need 'id'
-# - Most-starred repos: need 'stargazers_count', 'name', 'full_name'
-# - Popular repos by language: need 'language', 'stargazers_count'
-# - User/org repo count: need 'owner'
-# - Trending by creation date: need 'created_at'
-# - Language popularity over time: need 'language', 'created_at'
+# These fields are extracted from the detailed repo endpoint
+# Owner fields are flattened to top level for easier querying
 
 REQUIRED_FIELDS = [
-    # Minimal required fields (always present in /repositories endpoint)
-    'id',                  # Unique repository ID (required for counting)
-    'name',                # Repository name
-    'full_name',           # Full name (owner/repo)
-    'owner',               # Owner information (user or organization)
-    'html_url',            # Repository URL
-    # NOTE: The /repositories endpoint returns minimal data for old repos.
-    # If you need full metadata (created_at, stars, language, etc.),
-    # consider using /search/repositories or individual repo API calls.
-    # Uncomment fields below if you're using a different endpoint:
-    # 'description',
-    # 'created_at',
-    # 'updated_at',
-    # 'pushed_at',
-    # 'stargazers_count',
-    # 'watchers_count',
-    # 'forks_count',
-    # 'language',
-    # 'open_issues_count',
-    # 'default_branch',
-    # 'size',
+    # Repository fields
+    'id',
+    'name',
+    'full_name',
+    'html_url',
+    'description',
+    'stargazers_count',
+    'language',
+    'created_at',
+    'updated_at',
+
+    # Owner fields (flattened from owner object)
+    'owner_login',
+    'owner_id',
+    'owner_type',
+    'owner_avatar_url',
+    'owner_url',
 ]
 
 
@@ -79,21 +79,24 @@ class Config:
     # AWS S3 Settings
     AWS_S3_BUCKET = os.getenv('AWS_S3_BUCKET', 'github-api0-upload')
     AWS_REGION = os.getenv('AWS_REGION', 'us-east-2')
-    # Enable S3 folder partitioning by date (yyyy/mm/dd/)
     S3_USE_DATE_PARTITIONING = os.getenv('S3_USE_DATE_PARTITIONING', 'true').lower() == 'true'
 
     # GitHub API Settings
     GITHUB_API_BASE_URL = 'https://api.github.com'
-    GITHUB_REPOS_ENDPOINT = '/repositories'
-    GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')  # Empty for unauthenticated
+    GITHUB_TOKEN = os.getenv('GITHUB_TOKEN', '')
 
     # Extraction Settings
-    PAGES_TO_EXTRACT = int(os.getenv('PAGES_TO_EXTRACT', '2'))
-    REPOS_PER_PAGE = int(os.getenv('REPOS_PER_PAGE', '50'))  # Max is 100
+    REPOS_PER_PAGE = 100  # Maximum allowed by GitHub API
+    MAX_REQUESTS_PER_RUN = int(os.getenv('MAX_REQUESTS_PER_RUN', '60'))  # Rate limit
+    TEST_MODE_PAGES = 1  # Test mode: 1 page = 100 repos
 
     # Cache Settings
     USE_CACHE = os.getenv('USE_CACHE', 'true').lower() == 'true'
     CACHE_DIR = os.getenv('CACHE_DIR', 'cache')
+
+    # Since tracking (where to resume from)
+    SINCE_STORAGE_METHOD = os.getenv('SINCE_STORAGE_METHOD', 'file')  # Options: file, env, s3, dynamo
+    SINCE_FILE_PATH = os.getenv('SINCE_FILE_PATH', 'last_repo_id.txt')
 
     # Logging Settings
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
@@ -101,6 +104,7 @@ class Config:
 
     # Rate Limiting
     RATE_LIMIT_SLEEP = 60  # Sleep time when rate limited (seconds)
+    REQUEST_DELAY = 1.0  # Delay between requests to avoid hitting limits (seconds)
 
 
 # ============================================================================
@@ -116,10 +120,8 @@ def setup_logging() -> logging.Logger:
     Returns:
         logging.Logger: Configured logger instance
     """
-    # Create logs directory if it doesn't exist
     Path(Config.LOG_DIR).mkdir(parents=True, exist_ok=True)
 
-    # Create logger
     logger = logging.getLogger('GitHubExtractor')
     logger.setLevel(getattr(logging, Config.LOG_LEVEL))
 
@@ -155,56 +157,187 @@ logger = setup_logging()
 
 
 # ============================================================================
+# SINCE TRACKING - Multiple Storage Options
+# ============================================================================
+
+def get_last_repo_id() -> int:
+    """
+    Get the last processed repository ID to resume from.
+    Supports multiple storage methods configured via SINCE_STORAGE_METHOD.
+
+    Storage Methods:
+    - 'file': Store in local text file (default, simplest)
+    - 'env': Read from environment variable (for containerized environments)
+    - 's3': Store in S3 object (for distributed systems)
+    - 'dynamo': Store in DynamoDB (for production systems)
+
+    Returns:
+        int: Last processed repository ID (0 if starting fresh)
+    """
+    method = Config.SINCE_STORAGE_METHOD
+
+    if method == 'file':
+        # Method 1: Local file storage (simplest, good for single-server)
+        if os.path.exists(Config.SINCE_FILE_PATH):
+            with open(Config.SINCE_FILE_PATH, 'r') as f:
+                last_id = int(f.read().strip())
+                logger.info(f"Resuming from repo ID: {last_id} (file storage)")
+                return last_id
+        logger.info("Starting fresh from repo ID: 0 (no file found)")
+        return 0
+
+    elif method == 'env':
+        # Method 2: Environment variable (good for Docker/K8s with config management)
+        last_id = int(os.getenv('LAST_REPO_ID', '0'))
+        logger.info(f"Resuming from repo ID: {last_id} (environment variable)")
+        return last_id
+
+    elif method == 's3':
+        # Method 3: S3 storage (good for distributed systems, multiple instances)
+        try:
+            s3_client = boto3.client('s3', region_name=Config.AWS_REGION)
+            response = s3_client.get_object(
+                Bucket=Config.AWS_S3_BUCKET,
+                Key='github_extraction_state/last_repo_id.txt'
+            )
+            last_id = int(response['Body'].read().decode('utf-8').strip())
+            logger.info(f"Resuming from repo ID: {last_id} (S3 storage)")
+            return last_id
+        except s3_client.exceptions.NoSuchKey:
+            logger.info("Starting fresh from repo ID: 0 (no S3 state found)")
+            return 0
+        except Exception as e:
+            logger.warning(f"Error reading from S3: {e}. Starting from 0")
+            return 0
+
+    elif method == 'dynamo':
+        # Method 4: DynamoDB storage (best for production, ACID compliance)
+        try:
+            dynamodb = boto3.resource('dynamodb', region_name=Config.AWS_REGION)
+            table_name = os.getenv('DYNAMO_STATE_TABLE', 'github_extraction_state')
+            table = dynamodb.Table(table_name)
+
+            response = table.get_item(Key={'extraction_id': 'github_repos'})
+            if 'Item' in response:
+                last_id = int(response['Item']['last_repo_id'])
+                logger.info(f"Resuming from repo ID: {last_id} (DynamoDB storage)")
+                return last_id
+            else:
+                logger.info("Starting fresh from repo ID: 0 (no DynamoDB state)")
+                return 0
+        except Exception as e:
+            logger.warning(f"Error reading from DynamoDB: {e}. Starting from 0")
+            return 0
+
+    else:
+        logger.warning(f"Unknown SINCE_STORAGE_METHOD: {method}. Starting from 0")
+        return 0
+
+
+def save_last_repo_id(repo_id: int) -> None:
+    """
+    Save the last processed repository ID for future resumption.
+    Uses the same storage method as get_last_repo_id().
+
+    Args:
+        repo_id: Repository ID to save
+    """
+    method = Config.SINCE_STORAGE_METHOD
+
+    if method == 'file':
+        # Method 1: Local file storage
+        with open(Config.SINCE_FILE_PATH, 'w') as f:
+            f.write(str(repo_id))
+        logger.debug(f"Saved last repo ID {repo_id} to file")
+
+    elif method == 'env':
+        # Method 2: Environment variable (informational only - cannot persist)
+        logger.warning(f"Last repo ID: {repo_id} (env method - manual update required)")
+        logger.warning(f"Set LAST_REPO_ID={repo_id} before next run")
+
+    elif method == 's3':
+        # Method 3: S3 storage
+        try:
+            s3_client = boto3.client('s3', region_name=Config.AWS_REGION)
+            s3_client.put_object(
+                Bucket=Config.AWS_S3_BUCKET,
+                Key='github_extraction_state/last_repo_id.txt',
+                Body=str(repo_id).encode('utf-8')
+            )
+            logger.debug(f"Saved last repo ID {repo_id} to S3")
+        except Exception as e:
+            logger.error(f"Failed to save to S3: {e}")
+
+    elif method == 'dynamo':
+        # Method 4: DynamoDB storage
+        try:
+            dynamodb = boto3.resource('dynamodb', region_name=Config.AWS_REGION)
+            table_name = os.getenv('DYNAMO_STATE_TABLE', 'github_extraction_state')
+            table = dynamodb.Table(table_name)
+
+            table.put_item(Item={
+                'extraction_id': 'github_repos',
+                'last_repo_id': repo_id,
+                'updated_at': datetime.now().isoformat()
+            })
+            logger.debug(f"Saved last repo ID {repo_id} to DynamoDB")
+        except Exception as e:
+            logger.error(f"Failed to save to DynamoDB: {e}")
+
+
+# ============================================================================
 # CACHING FUNCTIONS
 # ============================================================================
 
-def get_cache_filename(page_number: int) -> str:
+def get_cache_filename(repo_id: int, cache_type: str = 'detail') -> str:
     """
-    Generate cache filename for a specific page.
+    Generate cache filename for a specific repository.
 
     Args:
-        page_number: Page number being cached
+        repo_id: Repository ID
+        cache_type: Type of cache ('list' or 'detail')
 
     Returns:
         str: Cache file path
     """
-    return f"{Config.CACHE_DIR}/github_repos_page_{page_number}.json"
+    return f"{Config.CACHE_DIR}/{cache_type}_repo_{repo_id}.json"
 
 
-def save_to_cache(page_number: int, data: List[Dict]) -> None:
+def save_to_cache(repo_id: int, data: Dict, cache_type: str = 'detail') -> None:
     """
-    Save API response to cache file for later use.
-    This helps minimize API calls during development and testing.
+    Save API response to cache file.
 
     Args:
-        page_number: Page number being cached
+        repo_id: Repository ID
         data: Repository data to cache
+        cache_type: Type of cache ('list' or 'detail')
     """
     Path(Config.CACHE_DIR).mkdir(parents=True, exist_ok=True)
-    cache_file = get_cache_filename(page_number)
+    cache_file = get_cache_filename(repo_id, cache_type)
 
     with open(cache_file, 'w') as f:
         json.dump(data, f, indent=2)
 
-    logger.debug(f"Cached page {page_number} to {cache_file}")
+    logger.debug(f"Cached {cache_type} for repo {repo_id}")
 
 
-def load_from_cache(page_number: int) -> Optional[List[Dict]]:
+def load_from_cache(repo_id: int, cache_type: str = 'detail') -> Optional[Dict]:
     """
     Load API response from cache if available.
 
     Args:
-        page_number: Page number to load from cache
+        repo_id: Repository ID
+        cache_type: Type of cache ('list' or 'detail')
 
     Returns:
-        Optional[List[Dict]]: Cached data if available, None otherwise
+        Optional[Dict]: Cached data if available, None otherwise
     """
-    cache_file = get_cache_filename(page_number)
+    cache_file = get_cache_filename(repo_id, cache_type)
 
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             data = json.load(f)
-        logger.info(f"Loaded page {page_number} from cache ({len(data)} repos)")
+        logger.debug(f"Loaded {cache_type} for repo {repo_id} from cache")
         return data
 
     return None
@@ -217,7 +350,6 @@ def load_from_cache(page_number: int) -> Optional[List[Dict]]:
 def get_api_headers() -> Dict[str, str]:
     """
     Build headers for GitHub API requests.
-    Includes authentication token if available.
 
     Returns:
         Dict[str, str]: Request headers
@@ -227,10 +359,9 @@ def get_api_headers() -> Dict[str, str]:
         'User-Agent': 'GitHub-Data-Extractor'
     }
 
-    # Add authentication if token is provided
     if Config.GITHUB_TOKEN:
         headers['Authorization'] = f'token {Config.GITHUB_TOKEN}'
-        logger.debug("Using authenticated API requests")
+        logger.debug("Using authenticated API requests (5000 req/hour)")
     else:
         logger.warning("Using unauthenticated API requests (60 req/hour limit)")
 
@@ -240,400 +371,227 @@ def get_api_headers() -> Dict[str, str]:
 def check_rate_limit(response: requests.Response) -> None:
     """
     Check GitHub API rate limit from response headers.
-    Logs current rate limit status.
 
     Args:
-        response: Response object from requests library
+        response: Response object from requests
     """
     remaining = response.headers.get('X-RateLimit-Remaining')
     limit = response.headers.get('X-RateLimit-Limit')
     reset_time = response.headers.get('X-RateLimit-Reset')
 
     if remaining and limit:
-        logger.info(f"Rate limit: {remaining}/{limit} remaining")
+        logger.debug(f"Rate limit: {remaining}/{limit} remaining")
 
         if int(remaining) < 5:
-            logger.warning(f"Low rate limit! Only {remaining} requests remaining")
+            logger.warning(f"Low rate limit: {remaining}/{limit} requests remaining")
 
-        if reset_time:
-            reset_datetime = datetime.fromtimestamp(int(reset_time))
-            logger.info(f"Rate limit resets at: {reset_datetime}")
+            if reset_time:
+                reset_dt = datetime.fromtimestamp(int(reset_time))
+                logger.warning(f"Rate limit resets at: {reset_dt}")
 
 
-def fetch_repositories_page(page_number: int, use_cache: bool = True) -> Tuple[Optional[List[Dict]], bool]:
+def fetch_repository_list(since: int, per_page: int = 100) -> Tuple[List[Dict], int]:
     """
-    Fetch a single page of repositories from GitHub API.
-    Uses cache if available and enabled.
+    STEP 1: Fetch repository list from /repositories endpoint.
+    This is lightweight and returns basic repo info.
 
     Args:
-        page_number: Page number to fetch (starts at 1)
-        use_cache: Whether to use cached data if available
+        since: Repository ID to start from
+        per_page: Number of repos per page (max 100)
 
     Returns:
-        Tuple[Optional[List[Dict]], bool]:
-            - List of repository dictionaries (or None on error)
-            - Boolean indicating if data came from cache
+        Tuple of (list of repo summaries, last repo ID in batch)
     """
-    # Check cache first if enabled
-    if use_cache and Config.USE_CACHE:
-        cached_data = load_from_cache(page_number)
-        if cached_data:
-            return cached_data, True
-
-    # Build API URL with pagination parameters
-    # since parameter: Only show repositories with ID greater than this
-    # This implements pagination by repository ID
-    since_id = (page_number - 1) * Config.REPOS_PER_PAGE
-    url = f"{Config.GITHUB_API_BASE_URL}{Config.GITHUB_REPOS_ENDPOINT}"
+    url = f"{Config.GITHUB_API_BASE_URL}/repositories"
     params = {
-        'since': since_id,
-        'per_page': Config.REPOS_PER_PAGE
+        'since': since,
+        'per_page': per_page
     }
 
-    logger.info(f"Fetching page {page_number} (since ID: {since_id})...")
+    headers = get_api_headers()
+
+    logger.info(f"Fetching repository list (since={since}, per_page={per_page})")
 
     try:
-        response = requests.get(
-            url,
-            params=params,
-            headers=get_api_headers(),
-            timeout=30
-        )
-
-        # Check rate limit status
-        check_rate_limit(response)
-
-        # Handle rate limiting
-        if response.status_code == 403:
-            if 'rate limit' in response.text.lower():
-                logger.error("Rate limit exceeded!")
-                logger.info(f"Sleeping for {Config.RATE_LIMIT_SLEEP} seconds...")
-                time.sleep(Config.RATE_LIMIT_SLEEP)
-                return None, False
-
-        # Raise exception for other HTTP errors
+        response = requests.get(url, headers=headers, params=params, timeout=30)
         response.raise_for_status()
 
-        # Parse JSON response
+        check_rate_limit(response)
+
         repos = response.json()
-        logger.info(f"Successfully fetched {len(repos)} repositories from page {page_number}")
 
-        # Save to cache for future use
-        save_to_cache(page_number, repos)
+        if not repos:
+            logger.info("No more repositories to fetch")
+            return [], since
 
-        return repos, False
+        last_id = repos[-1]['id']
+        logger.info(f"Fetched {len(repos)} repositories (last ID: {last_id})")
+
+        return repos, last_id
 
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error fetching page {page_number}: {e}")
-        return None, False
+        logger.error(f"Failed to fetch repository list: {e}")
+        return [], since
 
 
-def extract_all_repositories(pages: int, use_cache: bool = True) -> List[Dict]:
+def fetch_repository_details(owner: str, repo_name: str, repo_id: int, use_cache: bool = True) -> Optional[Dict]:
     """
-    Extract repositories from multiple pages.
-    Aggregates all repository data into a single list.
+    STEP 2: Fetch detailed repository information.
+    This endpoint provides complete metadata including stars, language, dates, etc.
 
     Args:
-        pages: Number of pages to extract
+        owner: Repository owner login
+        repo_name: Repository name
+        repo_id: Repository ID (for caching)
         use_cache: Whether to use cached data if available
 
     Returns:
-        List[Dict]: List of all repository dictionaries
+        Optional[Dict]: Detailed repository data or None if failed
     """
-    all_repos = []
-    cache_hits = 0
-    api_calls = 0
+    # Check cache first
+    if use_cache:
+        cached_data = load_from_cache(repo_id, 'detail')
+        if cached_data:
+            return cached_data
 
-    logger.info(f"Starting extraction of {pages} pages...")
-    logger.info(f"Cache enabled: {use_cache and Config.USE_CACHE}")
+    url = f"{Config.GITHUB_API_BASE_URL}/repos/{owner}/{repo_name}"
+    headers = get_api_headers()
 
-    for page_num in range(1, pages + 1):
-        repos, from_cache = fetch_repositories_page(page_num, use_cache)
+    logger.debug(f"Fetching details for {owner}/{repo_name}")
 
-        if repos is None:
-            logger.warning(f"Skipping page {page_num} due to error")
-            continue
+    try:
+        # Rate limiting: wait between requests
+        time.sleep(Config.REQUEST_DELAY)
 
-        all_repos.extend(repos)
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
 
-        if from_cache:
-            cache_hits += 1
+        check_rate_limit(response)
+
+        repo_data = response.json()
+
+        # Cache the response
+        if use_cache:
+            save_to_cache(repo_id, repo_data, 'detail')
+
+        return repo_data
+
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            logger.warning(f"Repository not found: {owner}/{repo_name} (may be deleted)")
+        elif e.response.status_code == 403:
+            logger.error(f"Rate limit exceeded or access forbidden")
         else:
-            api_calls += 1
-            # Add small delay between API calls to be respectful
-            if page_num < pages:
-                time.sleep(1)
+            logger.error(f"HTTP error fetching {owner}/{repo_name}: {e}")
+        return None
 
-    logger.info(f"Extraction complete: {len(all_repos)} total repositories")
-    logger.info(f"API calls: {api_calls}, Cache hits: {cache_hits}")
-
-    return all_repos
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Failed to fetch details for {owner}/{repo_name}: {e}")
+        return None
 
 
-# ============================================================================
-# DATA VALIDATION FUNCTIONS
-# ============================================================================
+def flatten_repository_data(repo: Dict) -> Dict:
+    """
+    Flatten repository data with owner fields at top level.
+    This makes it easier to query in Snowflake.
+
+    Args:
+        repo: Raw repository data from GitHub API
+
+    Returns:
+        Dict: Flattened repository data
+    """
+    try:
+        return {
+            # Repository fields
+            'id': repo.get('id'),
+            'name': repo.get('name'),
+            'full_name': repo.get('full_name'),
+            'html_url': repo.get('html_url'),
+            'description': repo.get('description'),
+            'stargazers_count': repo.get('stargazers_count'),
+            'language': repo.get('language'),
+            'created_at': repo.get('created_at'),
+            'updated_at': repo.get('updated_at'),
+
+            # Owner fields (flattened)
+            'owner_login': repo.get('owner', {}).get('login'),
+            'owner_id': repo.get('owner', {}).get('id'),
+            'owner_type': repo.get('owner', {}).get('type'),
+            'owner_avatar_url': repo.get('owner', {}).get('avatar_url'),
+            'owner_url': repo.get('owner', {}).get('html_url'),
+        }
+    except Exception as e:
+        logger.error(f"Error flattening repository data: {e}")
+        return {}
+
 
 def validate_repository(repo: Dict) -> Tuple[bool, List[str]]:
     """
-    Validate a single repository object for required fields and data quality.
-    Uses the global REQUIRED_FIELDS list defined at the top of the file.
+    Validate that repository has all required fields.
 
     Args:
-        repo: Repository dictionary to validate
+        repo: Flattened repository data
 
     Returns:
-        Tuple[bool, List[str]]:
-            - Boolean indicating if validation passed
-            - List of validation error messages
+        Tuple of (is_valid, list of missing fields)
     """
-    errors = []
+    missing_fields = []
 
-    # Check for required fields using global REQUIRED_FIELDS list
     for field in REQUIRED_FIELDS:
-        if field not in repo:
-            errors.append(f"Missing required field: {field}")
+        if field not in repo or repo[field] is None:
+            missing_fields.append(field)
 
-    # Validate data types and values
-    if 'id' in repo and not isinstance(repo['id'], int):
-        errors.append(f"Invalid id type: {type(repo['id'])}")
-
-    if 'id' in repo and repo['id'] <= 0:
-        errors.append(f"Invalid id value: {repo['id']}")
-
-    if 'name' in repo and not repo['name']:
-        errors.append("Repository name is empty")
-
-    if 'stargazers_count' in repo and repo['stargazers_count'] < 0:
-        errors.append(f"Invalid stargazers_count: {repo['stargazers_count']}")
-
-    # Validate owner structure
-    if 'owner' in repo:
-        if not isinstance(repo['owner'], dict):
-            errors.append("Owner is not a dictionary")
-        elif 'login' not in repo['owner']:
-            errors.append("Owner missing login field")
-
-    return len(errors) == 0, errors
-
-
-def filter_valid_repositories(repos: List[Dict]) -> Tuple[List[Dict], Dict]:
-    """
-    Filter repositories to keep only those that pass validation.
-    Invalid repositories are excluded from the final dataset.
-
-    Args:
-        repos: List of repository dictionaries to validate
-
-    Returns:
-        Tuple[List[Dict], Dict]:
-            - List of valid repositories only
-            - Validation summary with statistics
-    """
-    logger.info("Starting data validation and filtering...")
-
-    total_repos = len(repos)
-    valid_repos_list = []
-    invalid_repos = 0
-    all_errors = []
-
-    for idx, repo in enumerate(repos):
-        is_valid, errors = validate_repository(repo)
-
-        if is_valid:
-            valid_repos_list.append(repo)
-        else:
-            invalid_repos += 1
-            repo_name = repo.get('full_name', f'Unknown (index {idx})')
-            # Only log first few invalid repos to avoid cluttering logs
-            if invalid_repos <= 5:
-                logger.warning(f"Filtering out invalid repo {repo_name}: {errors[:3]}")  # Show first 3 errors
-            all_errors.extend(errors)
-
-    valid_count = len(valid_repos_list)
-
-    # Generate summary statistics
-    summary = {
-        'total_repositories_extracted': total_repos,
-        'valid_repositories': valid_count,
-        'invalid_repositories_filtered': invalid_repos,
-        'validation_rate': f"{(valid_count/total_repos*100):.2f}%" if total_repos > 0 else "0%",
-        'total_errors': len(all_errors),
-        'unique_errors': len(set(all_errors))
-    }
-
-    logger.info(f"Validation complete: {valid_count}/{total_repos} repositories valid")
-    logger.info(f"Filtered out: {invalid_repos} invalid repositories")
-    logger.info(f"Validation rate: {summary['validation_rate']}")
-
-    if invalid_repos > 5:
-        logger.info(f"Suppressed {invalid_repos - 5} validation warnings (too many to display)")
-
-    return valid_repos_list, summary
-
-
-def validate_all_repositories(repos: List[Dict]) -> Dict:
-    """
-    Validate all repositories and generate data quality report.
-    NOTE: This function only reports validation status, does NOT filter.
-    Use filter_valid_repositories() to exclude invalid repos.
-
-    Args:
-        repos: List of repository dictionaries to validate
-
-    Returns:
-        Dict: Validation summary with statistics
-    """
-    logger.info("Starting data validation...")
-
-    total_repos = len(repos)
-    valid_repos = 0
-    invalid_repos = 0
-    all_errors = []
-
-    for idx, repo in enumerate(repos):
-        is_valid, errors = validate_repository(repo)
-
-        if is_valid:
-            valid_repos += 1
-        else:
-            invalid_repos += 1
-            repo_name = repo.get('full_name', f'Unknown (index {idx})')
-            logger.debug(f"Validation failed for {repo_name}: {errors}")
-            all_errors.extend(errors)
-
-    # Generate summary statistics
-    summary = {
-        'total_repositories': total_repos,
-        'valid_repositories': valid_repos,
-        'invalid_repositories': invalid_repos,
-        'validation_rate': f"{(valid_repos/total_repos*100):.2f}%" if total_repos > 0 else "0%",
-        'total_errors': len(all_errors),
-        'unique_errors': len(set(all_errors))
-    }
-
-    logger.info(f"Validation complete: {valid_repos}/{total_repos} repositories valid")
-    logger.info(f"Validation rate: {summary['validation_rate']}")
-
-    if invalid_repos > 0:
-        logger.warning(f"Found {invalid_repos} invalid repositories")
-
-    return summary
-
-
-def get_data_statistics(repos: List[Dict]) -> Dict:
-    """
-    Calculate statistics about the extracted data.
-
-    Args:
-        repos: List of repository dictionaries
-
-    Returns:
-        Dict: Statistics summary
-    """
-    if not repos:
-        return {}
-
-    # Language distribution
-    languages = {}
-    total_stars = 0
-    total_forks = 0
-
-    for repo in repos:
-        lang = repo.get('language', 'Unknown')
-        languages[lang] = languages.get(lang, 0) + 1
-        total_stars += repo.get('stargazers_count', 0)
-        total_forks += repo.get('forks_count', 0)
-
-    # Sort languages by count
-    top_languages = sorted(languages.items(), key=lambda x: x[1], reverse=True)[:10]
-
-    stats = {
-        'total_repositories': len(repos),
-        'total_stars': total_stars,
-        'total_forks': total_forks,
-        'average_stars': total_stars / len(repos) if repos else 0,
-        'average_forks': total_forks / len(repos) if repos else 0,
-        'top_10_languages': dict(top_languages),
-        'unique_languages': len(languages)
-    }
-
-    logger.info(f"Data statistics: {stats['total_repositories']} repos, "
-                f"{stats['total_stars']} total stars, "
-                f"{stats['unique_languages']} unique languages")
-
-    return stats
+    is_valid = len(missing_fields) == 0
+    return is_valid, missing_fields
 
 
 # ============================================================================
-# S3 UPLOAD FUNCTIONS
+# S3 UPLOAD
 # ============================================================================
 
 def upload_to_s3(data: List[Dict], metadata: Dict) -> Optional[str]:
     """
-    Upload repository data to S3 bucket with optional date partitioning.
-
-    S3 Structure:
-    - With partitioning (default): s3://bucket/yyyy/mm/dd/github_repos_YYYY-MM-DD_HH-MM-SS.json
-    - Without partitioning: s3://bucket/github_repos_YYYY-MM-DD_HH-MM-SS.json
+    Upload repository data to S3 bucket.
 
     Args:
-        data: List of repository dictionaries to upload
-        metadata: Metadata about the extraction (validation, statistics)
+        data: List of repository dictionaries
+        metadata: Metadata about the extraction
 
     Returns:
-        Optional[str]: S3 object key if successful, None otherwise
+        Optional[str]: S3 key if successful, None otherwise
     """
-    # Generate timestamp and filename
-    now = datetime.now()
-    timestamp = now.strftime('%Y-%m-%d_%H-%M-%S')
-    base_filename = f"github_repos_{timestamp}.json"
-
-    # Build S3 key with optional date partitioning
-    if Config.S3_USE_DATE_PARTITIONING:
-        # Create folder structure: yyyy/mm/dd/filename
-        year = now.strftime('%Y')
-        month = now.strftime('%m')
-        day = now.strftime('%d')
-        s3_key = f"{year}/{month}/{day}/{base_filename}"
-        logger.info(f"Using date partitioning: {year}/{month}/{day}/")
-    else:
-        s3_key = base_filename
-        logger.info("Date partitioning disabled, uploading to root")
-
-    # Prepare data package with metadata
-    data_package = {
-        'metadata': {
-            'extraction_timestamp': timestamp,
-            'total_repositories': len(data),
-            'pages_extracted': Config.PAGES_TO_EXTRACT,
-            'repos_per_page': Config.REPOS_PER_PAGE,
-            **metadata
-        },
-        'repositories': data
-    }
-
     try:
-        # Initialize S3 client
         s3_client = boto3.client('s3', region_name=Config.AWS_REGION)
 
-        logger.info(f"Uploading to S3: s3://{Config.AWS_S3_BUCKET}/{s3_key}")
+        now = datetime.now()
+        timestamp = now.strftime('%Y-%m-%d_%H-%M-%S')
 
-        # Upload JSON data
+        # Build S3 key with optional date partitioning
+        if Config.S3_USE_DATE_PARTITIONING:
+            year = now.strftime('%Y')
+            month = now.strftime('%m')
+            day = now.strftime('%d')
+            s3_key = f"{year}/{month}/{day}/github_repos_{timestamp}.json"
+        else:
+            s3_key = f"github_repos_{timestamp}.json"
+
+        # Prepare upload data
+        upload_data = {
+            'metadata': metadata,
+            'repositories': data
+        }
+
+        # Upload to S3
+        logger.info(f"Uploading {len(data)} repositories to S3...")
         s3_client.put_object(
             Bucket=Config.AWS_S3_BUCKET,
             Key=s3_key,
-            Body=json.dumps(data_package, indent=2),
-            ContentType='application/json',
-            Metadata={
-                'extraction-timestamp': timestamp,
-                'repository-count': str(len(data))
-            }
+            Body=json.dumps(upload_data, indent=2),
+            ContentType='application/json'
         )
 
-        logger.info(f"Successfully uploaded {len(data)} repositories to S3")
-        logger.info(f"S3 URI: s3://{Config.AWS_S3_BUCKET}/{s3_key}")
-
+        logger.info(f"Successfully uploaded to s3://{Config.AWS_S3_BUCKET}/{s3_key}")
         return s3_key
 
     except Exception as e:
@@ -642,90 +600,230 @@ def upload_to_s3(data: List[Dict], metadata: Dict) -> Optional[str]:
 
 
 # ============================================================================
-# MAIN EXECUTION
+# MAIN EXTRACTION LOGIC
+# ============================================================================
+
+def extract_repositories(test_mode: bool = False, use_cache: bool = True, skip_upload: bool = False) -> Dict:
+    """
+    Main extraction function implementing two-step process.
+
+    STEP 1: Fetch repository list (lightweight, gets IDs)
+    STEP 2: Fetch detailed info for each repository
+
+    Args:
+        test_mode: If True, only extract 1 page (100 repos)
+        use_cache: Whether to use cached data
+        skip_upload: If True, skip S3 upload
+
+    Returns:
+        Dict: Extraction summary and statistics
+    """
+    start_time = datetime.now()
+
+    # Get last processed repo ID (resume capability)
+    since = get_last_repo_id()
+
+    # Calculate request budget
+    if test_mode:
+        max_repos = Config.REPOS_PER_PAGE * Config.TEST_MODE_PAGES  # 100 repos
+        logger.info("=" * 80)
+        logger.info("TEST MODE: Extracting 1 page (100 repositories)")
+        logger.info("=" * 80)
+    else:
+        # In production: 1 request for list + N requests for details
+        # With 60 req/hour limit: 1 list + 59 details = 59 repos
+        max_repos = Config.MAX_REQUESTS_PER_RUN - 1
+        logger.info("=" * 80)
+        logger.info(f"PRODUCTION MODE: Max {max_repos} repositories")
+        logger.info(f"Rate limit: {Config.MAX_REQUESTS_PER_RUN} requests/hour")
+        logger.info("=" * 80)
+
+    logger.info(f"Starting extraction from repo ID: {since}")
+
+    # STEP 1: Fetch repository list
+    logger.info("")
+    logger.info("STEP 1: Fetching repository list...")
+    logger.info("-" * 80)
+
+    repo_list, last_id = fetch_repository_list(since, Config.REPOS_PER_PAGE)
+
+    if not repo_list:
+        logger.warning("No repositories fetched. Exiting.")
+        return {
+            'success': False,
+            'message': 'No repositories to process'
+        }
+
+    logger.info(f"Retrieved {len(repo_list)} repositories from list endpoint")
+
+    # Limit to request budget
+    repos_to_process = repo_list[:max_repos]
+    logger.info(f"Processing {len(repos_to_process)} repositories (budget: {max_repos})")
+
+    # STEP 2: Fetch detailed information for each repo
+    logger.info("")
+    logger.info("STEP 2: Fetching detailed information for each repository...")
+    logger.info("-" * 80)
+
+    detailed_repos = []
+    valid_count = 0
+    invalid_count = 0
+    failed_count = 0
+    api_calls = 0
+    cache_hits = 0
+
+    for i, repo_summary in enumerate(repos_to_process, 1):
+        repo_id = repo_summary['id']
+        owner = repo_summary['owner']['login']
+        name = repo_summary['name']
+
+        logger.info(f"[{i}/{len(repos_to_process)}] Processing {owner}/{name} (ID: {repo_id})")
+
+        # Fetch detailed information
+        repo_detail = fetch_repository_details(owner, name, repo_id, use_cache)
+
+        if repo_detail is None:
+            failed_count += 1
+            api_calls += 1
+            continue
+
+        # Track API usage
+        if load_from_cache(repo_id, 'detail') and use_cache:
+            cache_hits += 1
+        else:
+            api_calls += 1
+
+        # Flatten the data
+        flattened = flatten_repository_data(repo_detail)
+
+        # Validate
+        is_valid, missing = validate_repository(flattened)
+
+        if is_valid:
+            detailed_repos.append(flattened)
+            valid_count += 1
+            logger.debug(f"  ✓ Valid repository")
+        else:
+            invalid_count += 1
+            if invalid_count <= 5:  # Only log first 5
+                logger.warning(f"  ✗ Invalid repository (missing: {', '.join(missing)})")
+
+        # Update last processed ID after each repo
+        save_last_repo_id(repo_id)
+
+    # Summary
+    logger.info("")
+    logger.info("=" * 80)
+    logger.info("EXTRACTION COMPLETE")
+    logger.info("=" * 80)
+    logger.info(f"Total repositories processed: {len(repos_to_process)}")
+    logger.info(f"Valid repositories: {valid_count}")
+    logger.info(f"Invalid repositories: {invalid_count}")
+    logger.info(f"Failed to fetch: {failed_count}")
+    logger.info(f"API calls made: {api_calls}")
+    logger.info(f"Cache hits: {cache_hits}")
+    logger.info(f"Last repo ID: {repo_id}")
+
+    # Prepare metadata
+    metadata = {
+        'extraction_date': datetime.now().isoformat(),
+        'start_repo_id': since,
+        'last_repo_id': repo_id,
+        'total_processed': len(repos_to_process),
+        'valid_count': valid_count,
+        'invalid_count': invalid_count,
+        'failed_count': failed_count,
+        'api_calls': api_calls,
+        'cache_hits': cache_hits,
+        'test_mode': test_mode,
+        'duration_seconds': (datetime.now() - start_time).total_seconds()
+    }
+
+    # Upload to S3
+    s3_key = None
+    if not skip_upload and detailed_repos:
+        logger.info("")
+        logger.info("Uploading to S3...")
+        s3_key = upload_to_s3(detailed_repos, metadata)
+    elif skip_upload:
+        logger.info("")
+        logger.info("Skipping S3 upload (--skip-upload flag)")
+    else:
+        logger.warning("")
+        logger.warning("No valid repositories to upload")
+
+    return {
+        'success': True,
+        'metadata': metadata,
+        's3_key': s3_key,
+        'repositories_count': len(detailed_repos)
+    }
+
+
+# ============================================================================
+# MAIN ENTRY POINT
 # ============================================================================
 
 def main():
-    """
-    Main execution function.
-    Orchestrates the complete extraction, validation, and upload process.
-    """
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Extract GitHub repository data')
-    parser.add_argument('--use-cache', action='store_true',
-                       help='Use cached API responses if available')
-    parser.add_argument('--skip-upload', action='store_true',
-                       help='Skip S3 upload (for testing)')
-    args = parser.parse_args()
+    """Main entry point for the script"""
 
-    logger.info("="*70)
-    logger.info("GitHub Data Extraction Pipeline Starting")
-    logger.info("="*70)
-    logger.info(f"Configuration:")
-    logger.info(f"  - Pages to extract: {Config.PAGES_TO_EXTRACT}")
-    logger.info(f"  - Repos per page: {Config.REPOS_PER_PAGE}")
-    logger.info(f"  - Expected total repos: ~{Config.PAGES_TO_EXTRACT * Config.REPOS_PER_PAGE}")
-    logger.info(f"  - S3 Bucket: {Config.AWS_S3_BUCKET}")
-    logger.info(f"  - AWS Region: {Config.AWS_REGION}")
-    logger.info(f"  - Use cache: {args.use_cache or Config.USE_CACHE}")
-    logger.info(f"  - Skip upload: {args.skip_upload}")
-    logger.info("="*70)
-
-    # Step 1: Extract repositories
-    logger.info("STEP 1: Extracting repositories from GitHub API")
-    repositories = extract_all_repositories(
-        pages=Config.PAGES_TO_EXTRACT,
-        use_cache=args.use_cache or Config.USE_CACHE
+    parser = argparse.ArgumentParser(
+        description='Extract GitHub repository data with two-step process'
+    )
+    parser.add_argument(
+        '--test-mode',
+        action='store_true',
+        help='Test mode: Extract only 1 page (100 repos)'
+    )
+    parser.add_argument(
+        '--use-cache',
+        action='store_true',
+        default=Config.USE_CACHE,
+        help='Use cached data if available'
+    )
+    parser.add_argument(
+        '--skip-upload',
+        action='store_true',
+        help='Skip S3 upload (for testing)'
     )
 
-    if not repositories:
-        logger.error("No repositories extracted. Exiting.")
-        return 1
+    args = parser.parse_args()
 
-    # Step 2: Validate and filter data quality
-    logger.info("STEP 2: Validating and filtering data quality")
-    valid_repositories, validation_summary = filter_valid_repositories(repositories)
+    try:
+        logger.info("GitHub Data Extraction Script - Two-Step Process")
+        logger.info(f"Configuration:")
+        logger.info(f"  - S3 Bucket: {Config.AWS_S3_BUCKET}")
+        logger.info(f"  - S3 Region: {Config.AWS_REGION}")
+        logger.info(f"  - Date Partitioning: {Config.S3_USE_DATE_PARTITIONING}")
+        logger.info(f"  - Cache Enabled: {args.use_cache}")
+        logger.info(f"  - Since Storage: {Config.SINCE_STORAGE_METHOD}")
+        logger.info("")
 
-    if not valid_repositories:
-        logger.error("No valid repositories after filtering. Exiting.")
-        logger.error("Consider adjusting REQUIRED_FIELDS at top of script")
-        return 1
+        result = extract_repositories(
+            test_mode=args.test_mode,
+            use_cache=args.use_cache,
+            skip_upload=args.skip_upload
+        )
 
-    # Step 3: Calculate statistics (only on valid repos)
-    logger.info("STEP 3: Calculating data statistics")
-    statistics = get_data_statistics(valid_repositories)
+        if result['success']:
+            logger.info("")
+            logger.info("✓ Extraction completed successfully")
+            if result.get('s3_key'):
+                logger.info(f"✓ Data uploaded to: {result['s3_key']}")
+            sys.exit(0)
+        else:
+            logger.error("✗ Extraction failed")
+            sys.exit(1)
 
-    # Step 4: Upload to S3
-    if not args.skip_upload:
-        logger.info("STEP 4: Uploading to S3")
-        metadata = {
-            'validation': validation_summary,
-            'statistics': statistics
-        }
-        s3_key = upload_to_s3(valid_repositories, metadata)
-
-        if not s3_key:
-            logger.error("S3 upload failed. Exiting.")
-            return 1
-    else:
-        logger.info("STEP 4: Skipping S3 upload (--skip-upload flag set)")
-
-    # Final summary
-    logger.info("="*70)
-    logger.info("Extraction Pipeline Complete!")
-    logger.info("="*70)
-    logger.info(f"Summary:")
-    logger.info(f"  ✓ Repositories extracted: {validation_summary['total_repositories_extracted']}")
-    logger.info(f"  ✓ Valid repositories uploaded: {len(valid_repositories)}")
-    logger.info(f"  ✓ Invalid repositories filtered: {validation_summary['invalid_repositories_filtered']}")
-    logger.info(f"  ✓ Validation rate: {validation_summary['validation_rate']}")
-    logger.info(f"  ✓ Top language: {list(statistics['top_10_languages'].keys())[0] if statistics['top_10_languages'] else 'N/A'}")
-    if not args.skip_upload:
-        logger.info(f"  ✓ S3 upload: Success")
-    logger.info("="*70)
-
-    return 0
+    except KeyboardInterrupt:
+        logger.warning("")
+        logger.warning("Extraction interrupted by user")
+        logger.info("Progress has been saved. Run again to resume.")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    main()

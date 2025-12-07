@@ -36,6 +36,9 @@ cache/
 logs/
 *.log
 
+# Since tracking
+last_repo_id.txt
+
 # IDE
 .vscode/
 .idea/
